@@ -100,8 +100,8 @@ pub fn parse_content_hpf(xml: &str) -> Result<PackageInfo, HwpxError> {
     // spine 순서대로 섹션 파일 추출
     for idref in &spine_order {
         if let Some((_, href, media_type, _)) = all_items.iter().find(|(id, _, _, _)| id == idref) {
-            if media_type == "application/xml" && href.contains("section") {
-                info.section_files.push(href.clone());
+            if media_type == "application/xml" && is_hwpx_section_href(href) {
+                info.section_files.push(normalize_section_href(href));
             }
         }
     }
@@ -110,12 +110,16 @@ pub fn parse_content_hpf(xml: &str) -> Result<PackageInfo, HwpxError> {
     if info.section_files.is_empty() {
         let mut section_items: Vec<_> = all_items
             .iter()
-            .filter(|(_, href, mt, _)| mt == "application/xml" && href.contains("section"))
+            .filter(|(_, href, mt, _)| mt == "application/xml" && is_hwpx_section_href(href))
             .collect();
-        section_items.sort_by(|a, b| a.1.cmp(&b.1));
+        section_items.sort_by(|a, b| {
+            section_number(&a.1)
+                .cmp(&section_number(&b.1))
+                .then_with(|| a.1.as_str().cmp(b.1.as_str()))
+        });
         info.section_files = section_items
             .into_iter()
-            .map(|(_, href, _, _)| href.clone())
+            .map(|(_, href, _, _)| normalize_section_href(href))
             .collect();
     }
 
@@ -216,6 +220,50 @@ fn collect_section_master_pages(
 /// XML 어트리뷰트 값을 String으로 변환
 fn attr_value(attr: &quick_xml::events::attributes::Attribute) -> String {
     attr.value.as_ref().to_owned()
+}
+
+fn section_file_name(href: &str) -> &str {
+    href.rsplit(['/', '\\']).next().unwrap_or(href)
+}
+
+/// `section` + digits + `.xml`, ignoring case. Avoids matching unrelated names
+/// that merely contain the substring "section".
+pub(crate) fn is_hwpx_section_href(href: &str) -> bool {
+    let name = section_file_name(href).to_ascii_lowercase();
+    let Some(rest) = name.strip_prefix("section") else {
+        return false;
+    };
+    let Some(number) = rest.strip_suffix(".xml") else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn section_number(href: &str) -> u32 {
+    let name = section_file_name(href).to_ascii_lowercase();
+    name.trim_start_matches("section")
+        .trim_end_matches(".xml")
+        .parse()
+        .unwrap_or(u32::MAX)
+}
+
+/// A bare `section0.xml` lives under `Contents/` in a normal HWPX package.
+pub(crate) fn normalize_section_href(href: &str) -> String {
+    if href.contains('/') || href.contains('\\') {
+        href.to_string()
+    } else {
+        format!("Contents/{href}")
+    }
+}
+
+/// `content.hpf` distribution="1" is a distribution document, not an open password.
+pub(crate) fn content_declares_distribution(xml: &str) -> bool {
+    xml.split("distribution=")
+        .nth(1)
+        .is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.starts_with("\"1\"") || rest.starts_with("'1'")
+        })
 }
 
 /// 네임스페이스 접두사를 제거하고 로컬 태그 이름을 반환
@@ -322,5 +370,28 @@ mod tests {
                 vec!["Contents/masterpage2.xml".to_string()]
             ]
         );
+    }
+
+    #[test]
+    fn test_section_hrefs_are_numeric_and_prefixed() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf/">
+  <opf:manifest>
+    <opf:item id="section10" href="Section10.xml" media-type="application/xml"/>
+    <opf:item id="section2" href="section2.xml" media-type="application/xml"/>
+    <opf:item id="note" href="subsection.xml" media-type="application/xml"/>
+  </opf:manifest>
+  <opf:spine/>
+</opf:package>"#;
+        let info = parse_content_hpf(xml).unwrap();
+        assert_eq!(
+            info.section_files,
+            vec![
+                "Contents/section2.xml".to_string(),
+                "Contents/Section10.xml".to_string()
+            ]
+        );
+        assert!(content_declares_distribution(r#"<opf:package distribution="1">"#));
+        assert!(!content_declares_distribution(r#"<opf:package distribution="0">"#));
     }
 }

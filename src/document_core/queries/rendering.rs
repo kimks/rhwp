@@ -268,43 +268,109 @@ fn find_render_node_mut(node: &mut RenderNode, node_id: u32) -> Option<&mut Rend
 pub(crate) fn paragraph_text_with_equations(para: &Paragraph) -> String {
     let text: Vec<char> = para.text.chars().collect();
     let control_positions = para.control_text_positions();
-    let mut equations: Vec<(usize, &str)> = para
+    let mut inserts: Vec<(usize, InlineControlText)> = para
         .controls
         .iter()
         .enumerate()
-        .filter_map(|(control_index, control)| match control {
-            Control::Equation(equation) if !equation.script.trim().is_empty() => Some((
-                control_positions
-                    .get(control_index)
-                    .copied()
-                    .unwrap_or(text.len())
-                    .min(text.len()),
-                equation.script.trim(),
-            )),
-            _ => None,
+        .filter_map(|(control_index, control)| {
+            let position = control_positions
+                .get(control_index)
+                .copied()
+                .unwrap_or(text.len())
+                .min(text.len());
+            match control {
+                Control::Equation(equation) if !equation.script.trim().is_empty() => Some((
+                    position,
+                    InlineControlText::Equation(equation.script.trim().to_string()),
+                )),
+                Control::CharOverlap(overlap) if !overlap.chars.is_empty() => Some((
+                    position,
+                    InlineControlText::Overlap(overlap.chars.iter().collect()),
+                )),
+                Control::Shape(shape) => {
+                    let story = shape_textbox_story(shape);
+                    if story.is_empty() {
+                        None
+                    } else {
+                        Some((position, InlineControlText::Story(story)))
+                    }
+                }
+                _ => None,
+            }
         })
         .collect();
-    equations.sort_by_key(|(position, _)| *position);
+    inserts.sort_by_key(|(position, _)| *position);
 
     let mut output = String::new();
-    let mut equation_index = 0usize;
+    let mut insert_index = 0usize;
     for position in 0..=text.len() {
-        while equation_index < equations.len() && equations[equation_index].0 == position {
-            let script = equations[equation_index].1;
-            if !output.is_empty() && !output.chars().last().is_some_and(char::is_whitespace) {
-                output.push(' ');
+        while insert_index < inserts.len() && inserts[insert_index].0 == position {
+            match &inserts[insert_index].1 {
+                InlineControlText::Equation(script) => {
+                    if !output.is_empty() && !output.chars().last().is_some_and(char::is_whitespace)
+                    {
+                        output.push(' ');
+                    }
+                    output.push_str(script);
+                    if position < text.len() && !text[position].is_whitespace() {
+                        output.push(' ');
+                    }
+                }
+                InlineControlText::Overlap(chars) => output.push_str(chars),
+                InlineControlText::Story(story) => {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(story);
+                }
             }
-            output.push_str(script);
-            if position < text.len() && !text[position].is_whitespace() {
-                output.push(' ');
-            }
-            equation_index += 1;
+            insert_index += 1;
         }
         if let Some(ch) = text.get(position) {
             output.push(*ch);
         }
     }
     output
+}
+
+enum InlineControlText {
+    Equation(String),
+    Overlap(String),
+    Story(String),
+}
+
+fn shape_textbox_story(shape: &crate::model::shape::ShapeObject) -> String {
+    let Some(text_box) = crate::document_core::helpers::get_textbox_from_shape(shape) else {
+        return String::new();
+    };
+    text_box
+        .paragraphs
+        .iter()
+        .map(|paragraph| paragraph.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Header/footer chrome such as "- 12 -" is a page number, not body text.
+fn is_letterless_page_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let has_dash = trimmed
+        .chars()
+        .any(|ch| matches!(ch, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}'));
+    if !has_dash {
+        return false;
+    }
+    let rest: String = trimmed
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace() && !matches!(ch, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}')
+        })
+        .collect();
+    !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn load_bounded_embedded_font_bytes(
@@ -8235,7 +8301,12 @@ impl DocumentCore {
             }
         }
 
-        fn collect_page_lines(node: &RenderNode, lines: &mut Vec<String>) {
+        fn collect_page_lines(
+            node: &RenderNode,
+            lines: &mut Vec<String>,
+            in_header_footer: bool,
+        ) {
+            let in_header_footer = in_header_footer || node.header_footer_source.is_some();
             if matches!(
                 node.node_type,
                 RenderNodeType::TextLine(_) | RenderNodeType::Equation(_)
@@ -8245,20 +8316,20 @@ impl DocumentCore {
 
                 collect_line_text(node, &mut line, &mut has_token);
 
-                if has_token {
+                if has_token && !(in_header_footer && is_letterless_page_chrome(&line)) {
                     lines.push(line);
                 }
                 return;
             }
 
             for child in &node.children {
-                collect_page_lines(child, lines);
+                collect_page_lines(child, lines, in_header_footer);
             }
         }
 
         let tree = self.build_page_tree(page_num)?;
         let mut lines = Vec::new();
-        collect_page_lines(&tree.root, &mut lines);
+        collect_page_lines(&tree.root, &mut lines, false);
         Ok(lines.join("\n"))
     }
 
@@ -8485,6 +8556,7 @@ impl DocumentCore {
             node: &RenderNode,
             doc: &crate::model::document::Document,
             items: &mut Vec<MarkdownItem>,
+            in_header_footer: bool,
         ) {
             fn collect_images_only(node: &RenderNode, items: &mut Vec<MarkdownItem>) {
                 if let RenderNodeType::Image(image_node) = &node.node_type {
@@ -8501,6 +8573,7 @@ impl DocumentCore {
                 }
             }
 
+            let in_header_footer = in_header_footer || node.header_footer_source.is_some();
             match &node.node_type {
                 RenderNodeType::Table(table_node) => {
                     if let (Some(si), Some(pi), Some(ci)) = (
@@ -8543,7 +8616,7 @@ impl DocumentCore {
                     for child in &node.children {
                         collect_line_text(child, &mut line, &mut has_token, items);
                     }
-                    if has_token {
+                    if has_token && !(in_header_footer && is_letterless_page_chrome(&line)) {
                         items.push(MarkdownItem::Line(line));
                     }
                     return;
@@ -8552,13 +8625,13 @@ impl DocumentCore {
             }
 
             for child in &node.children {
-                collect_markdown_items(child, doc, items);
+                collect_markdown_items(child, doc, items, in_header_footer);
             }
         }
 
         let tree = self.build_page_tree(page_num)?;
         let mut items: Vec<MarkdownItem> = Vec::new();
-        collect_markdown_items(&tree.root, &self.document, &mut items);
+        collect_markdown_items(&tree.root, &self.document, &mut items, false);
 
         let mut out = String::new();
         let mut images: Vec<(Option<usize>, Option<usize>, Option<usize>, u16)> = Vec::new();
