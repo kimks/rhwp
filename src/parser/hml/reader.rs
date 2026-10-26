@@ -1203,7 +1203,11 @@ impl<'a> ReadState<'a> {
             }
             return Ok(());
         }
-        if self.stack.iter().any(|name| name == "HEADER" || name == "FOOTER") {
+        if self
+            .stack
+            .iter()
+            .any(|name| name == "HEADER" || name == "FOOTER")
+        {
             let is_header = self.stack.iter().any(|name| name == "HEADER");
             let section = self.source.sections.last_mut().ok_or_else(|| {
                 HmlError::InvalidXml("header or footer outside SECTION".to_string())

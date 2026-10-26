@@ -1,6 +1,6 @@
 use crate::model::control::{Control, Equation};
-use crate::model::header_footer::{Footer, Header};
 use crate::model::document::{Document, FileHeader, HwpVersion, Section, SectionDef};
+use crate::model::header_footer::{Footer, Header};
 use crate::model::paragraph::{CharShapeRef, Paragraph};
 use crate::model::shape::{CommonObjAttr, DrawingObjAttr, RectangleShape, ShapeObject, TextBox};
 use crate::model::style::{BorderFill, CharShape, Font, LineSpacingType, ParaShape, Style, TabDef};
