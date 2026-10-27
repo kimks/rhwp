@@ -62,3 +62,45 @@ pub fn parse_hml_with_limits(bytes: &[u8], limits: &HmlLimits) -> Result<HmlPars
         preserved_fragments,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::control::Control;
+
+    #[test]
+    fn header_footer_and_notes_follow_visible_body_order() {
+        let xml = r#"<HWPML Version="2.9"><HEAD></HEAD><BODY><SECTION>
+          <P><TEXT>
+            <CHAR>앞</CHAR>
+            <FOOTNOTE><P><TEXT><CHAR>주석</CHAR></TEXT></P></FOOTNOTE>
+            <CHAR>뒤</CHAR>
+            <SECDEF>
+              <HEADER><P><TEXT><CHAR>머리</CHAR></TEXT></P></HEADER>
+              <FOOTER><P><TEXT><CHAR>꼬리</CHAR></TEXT></P></FOOTER>
+            </SECDEF>
+          </TEXT></P>
+        </SECTION></BODY></HWPML>"#;
+        let parsed = parse_hml(xml.as_bytes()).expect("hml");
+        let section = &parsed.document.sections[0];
+        assert_eq!(section.paragraphs.len(), 1);
+        assert_eq!(section.paragraphs[0].text, "앞주석뒤");
+        let mut saw_header = false;
+        let mut saw_footer = false;
+        for control in &section.paragraphs[0].controls {
+            match control {
+                Control::Header(header) => {
+                    saw_header = true;
+                    assert_eq!(header.paragraphs[0].text, "머리");
+                }
+                Control::Footer(footer) => {
+                    saw_footer = true;
+                    assert_eq!(footer.paragraphs[0].text, "꼬리");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_header);
+        assert!(saw_footer);
+    }
+}

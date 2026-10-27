@@ -1,5 +1,6 @@
 use crate::model::control::{Control, Equation};
 use crate::model::document::{Document, FileHeader, HwpVersion, Section, SectionDef};
+use crate::model::header_footer::{Footer, Header};
 use crate::model::paragraph::{CharShapeRef, Paragraph};
 use crate::model::shape::{CommonObjAttr, DrawingObjAttr, RectangleShape, ShapeObject, TextBox};
 use crate::model::style::{BorderFill, CharShape, Font, LineSpacingType, ParaShape, Style, TabDef};
@@ -37,11 +38,16 @@ pub(crate) fn into_document(mut source: HmlSource) -> Result<Document, HmlError>
                 .unwrap_or_else(crate::model::page::PageDef::a4_default),
             ..Default::default()
         };
-        let paragraphs = source_section
+        let mut paragraphs = source_section
             .paragraphs
             .into_iter()
             .map(into_paragraph)
             .collect::<Result<Vec<_>, _>>()?;
+        attach_header_footer(
+            &mut paragraphs,
+            source_section.header_paragraphs,
+            source_section.footer_paragraphs,
+        )?;
         document.sections.push(Section {
             trailing_lists: None,
             section_def,
@@ -101,6 +107,33 @@ fn add_default_resources(document: &mut Document) {
         lang_id: 1042,
         ..Default::default()
     }];
+}
+
+fn attach_header_footer(
+    paragraphs: &mut Vec<Paragraph>,
+    headers: Vec<HmlParagraph>,
+    footers: Vec<HmlParagraph>,
+) -> Result<(), HmlError> {
+    if headers.is_empty() && footers.is_empty() {
+        return Ok(());
+    }
+    if paragraphs.is_empty() {
+        paragraphs.push(Paragraph::default());
+    }
+    let host = &mut paragraphs[0];
+    for header in headers {
+        host.controls.push(Control::Header(Box::new(Header {
+            paragraphs: vec![into_paragraph(header)?],
+            ..Default::default()
+        })));
+    }
+    for footer in footers {
+        host.controls.push(Control::Footer(Box::new(Footer {
+            paragraphs: vec![into_paragraph(footer)?],
+            ..Default::default()
+        })));
+    }
+    Ok(())
 }
 
 fn into_paragraph(source: HmlParagraph) -> Result<Paragraph, HmlError> {

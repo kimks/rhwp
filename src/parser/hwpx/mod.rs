@@ -245,6 +245,56 @@ fn detect_odf_encryption(manifest_bytes: &[u8]) -> Option<String> {
     ))
 }
 
+fn read_hwpx_package_entry(
+    reader: &mut reader::HwpxReader,
+    candidates: &[&str],
+) -> Result<String, HwpxError> {
+    let names = reader.file_names();
+    for candidate in candidates {
+        if let Some(actual) = names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(candidate))
+        {
+            return reader.read_file(actual);
+        }
+    }
+    Err(HwpxError::MissingFile(
+        candidates.first().copied().unwrap_or("").to_string(),
+    ))
+}
+
+fn read_hwpx_section_entry(
+    reader: &mut reader::HwpxReader,
+    href: &str,
+) -> Result<String, HwpxError> {
+    let bare = href.rsplit(['/', '\\']).next().unwrap_or(href);
+    let mut candidates = vec![href.to_string()];
+    if !href.contains('/') && !href.contains('\\') {
+        candidates.push(format!("Contents/{href}"));
+    }
+    if bare != href {
+        candidates.push(bare.to_string());
+        candidates.push(format!("Contents/{bare}"));
+    }
+    let names = reader.file_names();
+    for candidate in &candidates {
+        if let Some(actual) = names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(candidate))
+        {
+            return reader.read_file(actual);
+        }
+    }
+    Err(HwpxError::MissingFile(href.to_string()))
+}
+
+fn hwpx_content_is_distribution(reader: &mut reader::HwpxReader) -> bool {
+    match read_hwpx_package_entry(reader, &["Contents/content.hpf", "content.hpf"]) {
+        Ok(xml) => content::content_declares_distribution(&xml),
+        Err(_) => false,
+    }
+}
+
 impl From<zip::result::ZipError> for HwpxError {
     fn from(e: zip::result::ZipError) -> Self {
         HwpxError::ZipError(e.to_string())
@@ -387,6 +437,12 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     match reader.read_xml_bytes_limited("META-INF/manifest.xml", reader::MAX_XML_SIZE) {
         Ok(manifest) => {
             if let Some(detail) = detect_odf_encryption(&manifest) {
+                if hwpx_content_is_distribution(&mut reader) {
+                    return Err(HwpxError::Encrypted(
+                        "배포용 암호화(distribution) 문서입니다. 열기 비밀번호로는 풀 수 없습니다"
+                            .to_string(),
+                    ));
+                }
                 return Err(HwpxError::Encrypted(detail));
             }
         }
@@ -446,7 +502,8 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     }
 
     // 2. content.hpf → 섹션 파일 목록 + BinData 목록
-    let content_xml = reader.read_file("Contents/content.hpf")?;
+    let content_xml =
+        read_hwpx_package_entry(&mut reader, &["Contents/content.hpf", "content.hpf"])?;
     // content.hpf 의 manifest/spine 은 본문 의존(섹션/BinData)이라 재생성하지만,
     // <opf:metadata>(저작자/생성·수정일자/주제 등)는 본문과 무관하므로 직렬화 시
     // 원본 블록을 그대로 splice 하기 위해 원본 바이트를 보존한다.
@@ -457,7 +514,15 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     let package_info = content::parse_content_hpf(&content_xml)?;
 
     // 3. header.xml → DocInfo, DocProperties
-    let header_xml = reader.read_file("Contents/header.xml")?;
+    let header_xml = read_hwpx_package_entry(
+        &mut reader,
+        &[
+            "Contents/header.xml",
+            "header.xml",
+            "Contents/head.xml",
+            "head.xml",
+        ],
+    )?;
     let tracking_visibility = tracked_changes::Visibility::from_header(&header_xml)?;
     // 평문 여백의 단위 전환은 header.xml이 아닌 패키지 xmlVersion에 따른다.
     let physical_plain_margin = hwpx_aux_entries
@@ -572,7 +637,15 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         .take(loaded_section_count)
         .enumerate()
     {
-        let section_xml = reader.read_file(section_href)?;
+        let section_xml = match read_hwpx_section_entry(&mut reader, section_href) {
+            Ok(xml) => xml,
+            Err(error @ HwpxError::XmlReadBudgetExceeded { .. }) => return Err(error),
+            Err(error) => {
+                eprintln!("경고: {} 읽기 실패: {}", section_href, error);
+                sections.push(Section::default());
+                continue;
+            }
+        };
         let stored_xml_digest = hwp3_page_ownership
             .as_ref()
             .map(|_| crate::model::hwp3_page_ownership::digest(section_xml.as_bytes()));
@@ -719,7 +792,7 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
         flags: 0,
         compressed: false,
         encrypted: false,
-        distribution: false,
+        distribution: content::content_declares_distribution(&content_xml),
         raw_data: None,
     };
 

@@ -92,6 +92,10 @@ pub(crate) struct HmlSource {
 pub(crate) struct HmlSection {
     pub page_def: Option<PageDef>,
     pub paragraphs: Vec<HmlParagraph>,
+    /// Header story paragraphs. They are not part of the section body.
+    pub header_paragraphs: Vec<HmlParagraph>,
+    /// Footer story paragraphs. They are not part of the section body.
+    pub footer_paragraphs: Vec<HmlParagraph>,
 }
 
 #[derive(Debug, Default)]
@@ -188,6 +192,14 @@ struct PendingCapture {
     parent: String,
     xml_path: String,
     modeled_siblings_before: usize,
+}
+
+fn push_visible_chars(paragraph: &mut HmlParagraph, text: &str) {
+    for character in text.chars() {
+        paragraph.char_offsets.push(paragraph.raw_pos);
+        paragraph.text.push(character);
+        paragraph.raw_pos += character.len_utf16() as u32;
+    }
 }
 
 struct ReadState<'a> {
@@ -1181,6 +1193,32 @@ impl<'a> ReadState<'a> {
             .paragraphs
             .pop()
             .ok_or_else(|| HmlError::InvalidXml("unexpected P end".to_string()))?;
+        if self
+            .stack
+            .iter()
+            .any(|name| name == "FOOTNOTE" || name == "ENDNOTE")
+        {
+            if let Some(host) = self.paragraphs.last_mut() {
+                push_visible_chars(host, &paragraph.text);
+            }
+            return Ok(());
+        }
+        if self
+            .stack
+            .iter()
+            .any(|name| name == "HEADER" || name == "FOOTER")
+        {
+            let is_header = self.stack.iter().any(|name| name == "HEADER");
+            let section = self.source.sections.last_mut().ok_or_else(|| {
+                HmlError::InvalidXml("header or footer outside SECTION".to_string())
+            })?;
+            if is_header {
+                section.header_paragraphs.push(paragraph);
+            } else {
+                section.footer_paragraphs.push(paragraph);
+            }
+            return Ok(());
+        }
         // [#2723] 종전엔 종류 우선순위(셀 먼저)로 골라, CELL 안 사각형의 DRAWTEXT
         // 문단이 셀로 흘러들어 글상자는 비고(adapter 가 None 으로 접음) 셀에는 이물
         // 문단이 남았다. 글상자가 스택상 더 안쪽일 때만 글상자를 고르고, 나머지는

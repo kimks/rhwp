@@ -58,6 +58,7 @@ pub fn parse_hwpx_section(xml: &str) -> Result<Section, HwpxError> {
     // 구역 없음)이나 다음 구역에 값이 새지 않게 한다.
     let sized = section_xml_has_sized_lineseg(xml);
     let _lineseg_scope = SectionLinesegScope::enter(sized);
+    let _delete_scope = DeleteDepthReset::enter();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -72,6 +73,11 @@ pub fn parse_hwpx_section(xml: &str) -> Result<Section, HwpxError> {
                             section.section_def = sec_def;
                         }
                         section.paragraphs.push(para);
+                    }
+                    // Memo containers are not body paragraphs. Leaving the start
+                    // tag unconsumed promotes every inner hp:p into the section.
+                    b"memogroup" | b"memo" => {
+                        skip_element(&mut reader, local)?;
                     }
                     _ => {}
                 }
@@ -531,6 +537,9 @@ const MAX_HWPX_SECTION_DEPTH: u32 = 16;
 thread_local! {
     // 완전 경로 — 이 모듈의 `Cell` 은 이미 `crate::model::table::Cell`(표 셀)이다.
     static HWPX_SECTION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Visible-text track changes. Nested table, caption, and drawText stories
+    /// reset this to 0 and restore it on exit.
+    static HWPX_DELETE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// [#4898] 이 구역의 lineseg 가 **배치 권위를 갖는가** — 0 아닌 높이가 하나라도 있으면 참.
     ///
     /// #2070 의 0높이 정규화를 문단이 아니라 **구역** 범위로 판단하기 위한 신호다.
@@ -589,6 +598,52 @@ impl SectionDepthGuard {
 impl Drop for SectionDepthGuard {
     fn drop(&mut self) {
         HWPX_SECTION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn hwpx_in_deleted_range() -> bool {
+    HWPX_DELETE_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn hwpx_track_delete_begin() {
+    HWPX_DELETE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+}
+
+fn hwpx_track_delete_end() {
+    HWPX_DELETE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+}
+
+/// Clears track-change depth for one section parse, including error returns.
+struct DeleteDepthReset;
+
+impl DeleteDepthReset {
+    fn enter() -> Self {
+        HWPX_DELETE_DEPTH.with(|depth| depth.set(0));
+        Self
+    }
+}
+
+impl Drop for DeleteDepthReset {
+    fn drop(&mut self) {
+        HWPX_DELETE_DEPTH.with(|depth| depth.set(0));
+    }
+}
+
+/// Table cells, captions, and drawing text keep their own deletion depth.
+struct IndependentDeletionStory {
+    saved: u32,
+}
+
+impl IndependentDeletionStory {
+    fn enter() -> Self {
+        let saved = HWPX_DELETE_DEPTH.with(|depth| depth.replace(0));
+        Self { saved }
+    }
+}
+
+impl Drop for IndependentDeletionStory {
+    fn drop(&mut self) {
+        HWPX_DELETE_DEPTH.with(|depth| depth.set(self.saved));
     }
 }
 
@@ -706,6 +761,11 @@ fn parse_paragraph_body(
             Ok(Event::Start(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                let text_len_before = text_parts.len();
+                let control_len_before = para.controls.len();
+                let tab_len_before = para.tab_extended.len();
+                let mask_before = para.control_mask;
+                let column_before = para.column_type;
                 match local {
                     b"markpenBegin" | b"markpenEnd" => {
                         if local == b"markpenEnd" {
@@ -752,6 +812,11 @@ fn parse_paragraph_body(
                         }
                         text_parts.extend(content.parts);
                         para.tab_extended.extend(content.tabs);
+                        if content.column_break
+                            && para.column_type != crate::model::paragraph::ColumnBreakType::Page
+                        {
+                            para.column_type = crate::model::paragraph::ColumnBreakType::Column;
+                        }
                         // [#5174] 묶음 빈칸의 출처 표기를 문단에 남긴다 — 직렬화기가 이
                         // 비트로 요소/리터럴을 갈라 원본 표기를 그대로 되돌린다.
                         if content.nb_space_element {
@@ -912,10 +977,25 @@ fn parse_paragraph_body(
                     }
                     _ => {}
                 }
+                // Drop characters and objects that sit inside deleteBegin..deleteEnd.
+                // Insert ranges stay. The check runs after the child parser so a
+                // deleteEnd in this element can reopen the visible text.
+                if hwpx_in_deleted_range() {
+                    text_parts.truncate(text_len_before);
+                    para.controls.truncate(control_len_before);
+                    para.tab_extended.truncate(tab_len_before);
+                    para.control_mask = mask_before;
+                    para.column_type = column_before;
+                }
             }
             Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                let text_len_before = text_parts.len();
+                let control_len_before = para.controls.len();
+                let tab_len_before = para.tab_extended.len();
+                let mask_before = para.control_mask;
+                let column_before = para.column_type;
                 match local {
                     b"markpenBegin" | b"markpenEnd" => {
                         if local == b"markpenEnd" {
@@ -942,11 +1022,24 @@ fn parse_paragraph_body(
                         let utf16_pos = calc_utf16_len_from_parts(&text_parts);
                         char_shape_changes.push((utf16_pos, current_char_shape_id));
                     }
-                    b"lineBreak" | b"softHyphen" => {
+                    b"lineBreak" => {
                         text_parts.push("\n".to_string());
                     }
+                    // A line break is a newline. Other break types stay out of the text.
+                    b"br" => {
+                        if br_emits_newline(ce) {
+                            text_parts.push("\n".to_string());
+                        }
+                    }
+                    // Soft hyphen is a line-end opportunity, not a paragraph break.
+                    b"softHyphen" => {}
+                    b"hwSpace" => {
+                        text_parts.push(" ".to_string());
+                    }
                     b"columnBreak" => {
-                        text_parts.push("\n".to_string());
+                        if para.column_type != crate::model::paragraph::ColumnBreakType::Page {
+                            para.column_type = crate::model::paragraph::ColumnBreakType::Column;
+                        }
                     }
                     b"tab" => {
                         text_parts.push("\t".to_string());
@@ -960,6 +1053,13 @@ fn parse_paragraph_body(
                         para.line_segs.push(parse_lineseg_element(ce));
                     }
                     _ => {}
+                }
+                if hwpx_in_deleted_range() {
+                    text_parts.truncate(text_len_before);
+                    para.controls.truncate(control_len_before);
+                    para.tab_extended.truncate(tab_len_before);
+                    para.control_mask = mask_before;
+                    para.column_type = column_before;
                 }
             }
             Ok(Event::End(ref ee)) => {
@@ -2154,6 +2254,7 @@ struct ParsedTextContent {
     hyphen_element: bool,
     fixed_space_element: bool,
     literal_figure_spaces: Vec<usize>,
+    column_break: bool,
 }
 
 fn visible_text_part_len(parts: &[String]) -> usize {
@@ -2190,6 +2291,20 @@ fn append_literal_text(
     text.push_str(addition);
 }
 
+/// `hp:br type="line"` (or a missing type) is a newline. Other types are not text.
+fn br_emits_newline(element: &quick_xml::events::BytesStart) -> bool {
+    let mut saw_type = false;
+    let mut is_line = false;
+    for attr in element.attributes().flatten() {
+        if attr.key.as_ref().as_bytes() == b"type" {
+            saw_type = true;
+            let value = attr.value.as_ref();
+            is_line = value.eq_ignore_ascii_case("line");
+        }
+    }
+    !saw_type || is_line
+}
+
 fn read_text_content_with_tabs(reader: &mut Reader<&[u8]>) -> Result<ParsedTextContent, HwpxError> {
     let mut parts: Vec<String> = Vec::new();
     let mut text = String::new();
@@ -2198,6 +2313,7 @@ fn read_text_content_with_tabs(reader: &mut Reader<&[u8]>) -> Result<ParsedTextC
     let mut saw_hyphen_element = false;
     let mut saw_fixed_space_element = false;
     let mut literal_figure_spaces = Vec::new();
+    let mut saw_column_break = false;
     let mut buf = Vec::new();
 
     loop {
@@ -2234,7 +2350,14 @@ fn read_text_content_with_tabs(reader: &mut Reader<&[u8]>) -> Result<ParsedTextC
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
                 match local {
-                    b"lineBreak" | b"columnBreak" => text.push('\n'),
+                    b"lineBreak" => text.push('\n'),
+                    b"br" => {
+                        if br_emits_newline(ce) {
+                            text.push('\n');
+                        }
+                    }
+                    b"columnBreak" => saw_column_break = true,
+                    b"hwSpace" => text.push(' '),
                     b"tab" => {
                         text.push('\t');
                         // [#7170] "데이터 없음" 마커(width=0, #4403)도 자리표로 실어 순번을
@@ -2326,6 +2449,7 @@ fn read_text_content_with_tabs(reader: &mut Reader<&[u8]>) -> Result<ParsedTextC
         hyphen_element: saw_hyphen_element,
         fixed_space_element: saw_fixed_space_element,
         literal_figure_spaces,
+        column_break: saw_column_break,
     })
 }
 
@@ -2366,6 +2490,7 @@ fn parse_table(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
 ) -> Result<Table, HwpxError> {
+    let _independent_story = IndependentDeletionStory::enter();
     let mut table = Table::default();
     let mut table_record_flags = 0u32;
     // [#2697] numberingType 부재 시 표의 자연 기본값은 TABLE (종전 방출 리터럴과 동일).
@@ -2793,6 +2918,7 @@ fn parse_caption(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
 ) -> Result<crate::model::shape::Caption, HwpxError> {
+    let _independent_story = IndependentDeletionStory::enter();
     use crate::model::shape::{Caption, CaptionDirection};
 
     let mut caption = Caption::default();
@@ -4592,6 +4718,7 @@ fn parse_draw_text_body(
     reader: &mut Reader<&[u8]>,
     text_box: &mut TextBox,
 ) -> Result<(), HwpxError> {
+    let _independent_story = IndependentDeletionStory::enter();
     let mut buf = Vec::new();
     loop {
         let event = reader.read_event_into(&mut buf);
@@ -5196,7 +5323,21 @@ fn parse_ctrl(
             Ok(Event::Start(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                let control_len_before = controls.len();
+                let text_len_before = text_parts.len();
+                let field_len_before = field_end_attrs.len();
                 match local {
+                    b"deleteBegin" => {
+                        hwpx_track_delete_begin();
+                        skip_element(reader, b"deleteBegin")?;
+                    }
+                    b"deleteEnd" => {
+                        hwpx_track_delete_end();
+                        skip_element(reader, b"deleteEnd")?;
+                    }
+                    // Inserted text belongs in the final visible document.
+                    b"insertBegin" => skip_element(reader, b"insertBegin")?,
+                    b"insertEnd" => skip_element(reader, b"insertEnd")?,
                     b"colPr" => {
                         let cd = parse_col_pr_with_children(ce, reader)?;
                         controls.push(Control::ColumnDef(cd));
@@ -5302,11 +5443,22 @@ fn parse_ctrl(
                         skip_element(reader, &tag)?;
                     }
                 }
+                if hwpx_in_deleted_range() {
+                    controls.truncate(control_len_before);
+                    text_parts.truncate(text_len_before);
+                    field_end_attrs.truncate(field_len_before);
+                }
             }
             Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
+                let control_len_before = controls.len();
+                let text_len_before = text_parts.len();
+                let field_len_before = field_end_attrs.len();
                 match local {
+                    b"deleteBegin" => hwpx_track_delete_begin(),
+                    b"deleteEnd" => hwpx_track_delete_end(),
+                    b"insertBegin" | b"insertEnd" => {}
                     b"colPr" => {
                         let cd = parse_col_pr(ce);
                         controls.push(Control::ColumnDef(cd));
@@ -5364,6 +5516,11 @@ fn parse_ctrl(
                         text_parts.push("\u{0002}".to_string());
                     }
                     _ => {}
+                }
+                if hwpx_in_deleted_range() {
+                    controls.truncate(control_len_before);
+                    text_parts.truncate(text_len_before);
+                    field_end_attrs.truncate(field_len_before);
                 }
             }
             Ok(Event::End(ref ee)) => {
@@ -7957,6 +8114,57 @@ mod tests {
         assert_eq!(section.paragraphs.len(), 1);
         assert_eq!(section.paragraphs[0].text, "Hello World");
         assert_eq!(section.paragraphs[0].para_shape_id, 0);
+    }
+
+    #[test]
+    fn test_visible_text_skips_deletions_memos_and_break_elements() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:t>앞</hp:t>
+      <hp:ctrl><hp:deleteBegin/></hp:ctrl>
+      <hp:t>지움</hp:t>
+      <hp:ctrl><hp:deleteEnd/></hp:ctrl>
+      <hp:t>뒤<hp:hwSpace/>A<hp:br type="line"/>B<hp:br type="page"/>C</hp:t>
+      <hp:softHyphen/>
+      <hp:columnBreak/>
+    </hp:run>
+  </hp:p>
+  <hp:memogroup>
+    <hp:p paraPrIDRef="0" styleIDRef="0">
+      <hp:run charPrIDRef="0"><hp:t>메모</hp:t></hp:run>
+    </hp:p>
+  </hp:memogroup>
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:ctrl><hp:deleteBegin/></hp:ctrl>
+      <hp:t>바깥</hp:t>
+      <hp:tbl>
+        <hp:tr>
+          <hp:tc>
+            <hp:p paraPrIDRef="0" styleIDRef="0">
+              <hp:run charPrIDRef="0"><hp:t>칸</hp:t></hp:run>
+            </hp:p>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+      <hp:ctrl><hp:deleteEnd/></hp:ctrl>
+      <hp:t>남음</hp:t>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        assert_eq!(section.paragraphs.len(), 2);
+        assert_eq!(section.paragraphs[0].text, "앞뒤 A\nBC");
+        assert_eq!(
+            section.paragraphs[0].column_type,
+            crate::model::paragraph::ColumnBreakType::Column
+        );
+        assert_eq!(section.paragraphs[1].text, "남음");
+        assert!(section.paragraphs[1].controls.is_empty());
     }
 
     // ---------- [#4759] 문단↔표↔셀 상호재귀 무한 중첩 → 스택 오버플로 DoS 가드 ----------
