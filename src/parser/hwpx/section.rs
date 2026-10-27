@@ -813,8 +813,7 @@ fn parse_paragraph_body(
                         text_parts.extend(content.parts);
                         para.tab_extended.extend(content.tabs);
                         if content.column_break
-                            && para.column_type
-                                != crate::model::paragraph::ColumnBreakType::Page
+                            && para.column_type != crate::model::paragraph::ColumnBreakType::Page
                         {
                             para.column_type = crate::model::paragraph::ColumnBreakType::Column;
                         }

@@ -258,12 +258,10 @@ pub(crate) fn normalize_section_href(href: &str) -> String {
 
 /// `content.hpf` distribution="1" is a distribution document, not an open password.
 pub(crate) fn content_declares_distribution(xml: &str) -> bool {
-    xml.split("distribution=")
-        .nth(1)
-        .is_some_and(|rest| {
-            let rest = rest.trim_start();
-            rest.starts_with("\"1\"") || rest.starts_with("'1'")
-        })
+    xml.split("distribution=").nth(1).is_some_and(|rest| {
+        let rest = rest.trim_start();
+        rest.starts_with("\"1\"") || rest.starts_with("'1'")
+    })
 }
 
 /// 네임스페이스 접두사를 제거하고 로컬 태그 이름을 반환
@@ -391,7 +389,11 @@ mod tests {
                 "Contents/Section10.xml".to_string()
             ]
         );
-        assert!(content_declares_distribution(r#"<opf:package distribution="1">"#));
-        assert!(!content_declares_distribution(r#"<opf:package distribution="0">"#));
+        assert!(content_declares_distribution(
+            r#"<opf:package distribution="1">"#
+        ));
+        assert!(!content_declares_distribution(
+            r#"<opf:package distribution="0">"#
+        ));
     }
 }

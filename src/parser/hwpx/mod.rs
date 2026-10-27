@@ -502,10 +502,8 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     }
 
     // 2. content.hpf → 섹션 파일 목록 + BinData 목록
-    let content_xml = read_hwpx_package_entry(
-        &mut reader,
-        &["Contents/content.hpf", "content.hpf"],
-    )?;
+    let content_xml =
+        read_hwpx_package_entry(&mut reader, &["Contents/content.hpf", "content.hpf"])?;
     // content.hpf 의 manifest/spine 은 본문 의존(섹션/BinData)이라 재생성하지만,
     // <opf:metadata>(저작자/생성·수정일자/주제 등)는 본문과 무관하므로 직렬화 시
     // 원본 블록을 그대로 splice 하기 위해 원본 바이트를 보존한다.

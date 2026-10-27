@@ -8301,11 +8301,7 @@ impl DocumentCore {
             }
         }
 
-        fn collect_page_lines(
-            node: &RenderNode,
-            lines: &mut Vec<String>,
-            in_header_footer: bool,
-        ) {
+        fn collect_page_lines(node: &RenderNode, lines: &mut Vec<String>, in_header_footer: bool) {
             let in_header_footer = in_header_footer || node.header_footer_source.is_some();
             if matches!(
                 node.node_type,
